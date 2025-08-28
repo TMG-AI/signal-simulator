@@ -49,7 +49,6 @@ export default function Campaigns() {
       setErr("You must be signed in.");
       return;
     }
-    // basic number parsing
     const commission = parseFloat(form.commission_pct || "0");
     const agent = parseFloat(form.claims_agent_pct || "0");
     if (Number.isNaN(commission) || commission < 0) return setErr("Commission must be a non-negative number.");
@@ -73,7 +72,6 @@ export default function Campaigns() {
     const { error } = await supabase.from("campaign").insert(payload);
     if (error) setErr(error.message);
     else {
-      // reset part of the form
       setForm((f) => ({ ...f, name: "", case_name: "" }));
     }
     setSaving(false);
@@ -171,6 +169,7 @@ export default function Campaigns() {
                 <th style={{ textAlign: "right", borderBottom: "1px solid #eee", padding: 8 }}>Agent %</th>
                 <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: 8 }}>Primary Audience</th>
                 <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: 8 }}>Flags</th>
+                <th style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: 8 }}>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -185,6 +184,9 @@ export default function Campaigns() {
                   <td style={{ borderBottom: "1px solid #f3f3f3", padding: 8 }}>{r.primary_audience || "—"}</td>
                   <td style={{ borderBottom: "1px solid #f3f3f3", padding: 8 }}>
                     {r.is_national ? "National" : "Targeted"} {r.has_claims_agent ? " • Has Claims Agent" : ""}
+                  </td>
+                  <td style={{ borderBottom: "1px solid #f3f3f3", padding: 8 }}>
+                    <Link href={`/campaigns/${r.id}/line-items`}>Manage line items</Link>
                   </td>
                 </tr>
               ))}
