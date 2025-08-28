@@ -7,7 +7,7 @@ export default function Home() {
 
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => setEmail(data.user?.email ?? null));
-    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
       setEmail(session?.user?.email ?? null);
     });
     return () => sub.subscription.unsubscribe();
@@ -16,7 +16,7 @@ export default function Home() {
   if (!email) {
     return (
       <main style={{ padding: "2rem", fontFamily: "sans-serif" }}>
-        <h1>Signal Simulator 👋</h1>
+        <h1>Hello Signal Simulator 👋</h1>
         <p>You are not signed in.</p>
         <Link href="/login">Go to login</Link>
       </main>
@@ -30,7 +30,10 @@ export default function Home() {
   return (
     <main style={{ padding: "2rem", fontFamily: "sans-serif" }}>
       <p>Signed in as <strong>{email}</strong></p>
-      <button onClick={signOut}>Sign out</button>
+      <div style={{ display: "flex", gap: 12, margin: "12px 0" }}>
+        <Link href="/campaigns">Campaigns</Link>
+        <button onClick={signOut}>Sign out</button>
+      </div>
     </main>
   );
 }
