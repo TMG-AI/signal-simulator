@@ -129,6 +129,13 @@ export default function LineItemsPage() {
         <div style={{ display: "flex", gap: 12 }}>
           <Link href="/campaigns">← Back to Campaigns</Link>
           <Link href="/">Home</Link>
+    {id && (
+  <Link href={`/campaigns/${id}/totals`}>
+    <button style={{ border: "1px solid #ccc", borderRadius: 6, padding: "6px 10px" }}>
+      View totals
+    </button>
+  </Link>
+)}
         </div>
       </div>
 
