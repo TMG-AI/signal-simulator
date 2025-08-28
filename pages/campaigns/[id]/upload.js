@@ -11,7 +11,10 @@ export default function BulkUploadPage() {
   const [email, setEmail] = useState(null);
   const [campaign, setCampaign] = useState(null);
 
-  // NEW: parse state
+  // Parser readiness + parse state
+  const [xlsxReady, setXlsxReady] = useState(false);
+  const [papaReady, setPapaReady] = useState(false);
+
   const [headers, setHeaders] = useState([]);
   const [rows, setRows] = useState([]);
   const [parseErr, setParseErr] = useState("");
@@ -25,7 +28,7 @@ export default function BulkUploadPage() {
     return () => sub.subscription.unsubscribe();
   }, []);
 
-  // Load campaign name (nice header)
+  // Load campaign name
   useEffect(() => {
     if (!campaignId) return;
     (async () => {
@@ -38,19 +41,27 @@ export default function BulkUploadPage() {
     })();
   }, [campaignId]);
 
-  // NEW: handle file selection (CSV or XLSX)
-  function onFileChange(e) {
+  function resetParse() {
     setParseErr("");
     setHeaders([]);
     setRows([]);
+  }
+
+  // Handle file selection (CSV or XLSX)
+  function onFileChange(e) {
+    resetParse();
 
     const file = e.target.files?.[0];
     if (!file) return;
 
     const name = (file.name || "").toLowerCase();
 
-    // .xlsx path — uses window.XLSX from the CDN script below
+    // XLSX path
     if (name.endsWith(".xlsx")) {
+      if (!xlsxReady || !window.XLSX) {
+        setParseErr("Excel parser is still loading. Wait a second and choose the file again.");
+        return;
+      }
       const reader = new FileReader();
       reader.onload = (evt) => {
         try {
@@ -64,10 +75,16 @@ export default function BulkUploadPage() {
             return;
           }
 
-          const hdrs = (aoa[0] || []).map((h) => (h || "").toString().trim());
+          // Build headers (give defaults if a header cell is blank)
+          const hdrs = (aoa[0] || []).map((h, i) => {
+            const v = (h ?? "").toString().trim();
+            return v || `Column_${i + 1}`;
+          });
+
+          // Rows -> array of objects keyed by header
           const body = aoa
             .slice(1)
-            .filter((r) => r && r.some((c) => String(c || "").trim() !== ""))
+            .filter((r) => r && r.some((c) => String(c ?? "").trim() !== ""))
             .map((arr) => {
               const obj = {};
               hdrs.forEach((h, i) => (obj[h] = arr[i]));
@@ -77,24 +94,30 @@ export default function BulkUploadPage() {
           setHeaders(hdrs);
           setRows(body);
         } catch (err) {
-          setParseErr(err.message || "Failed to read .xlsx");
+          console.error(err);
+          setParseErr(err?.message || "Failed to read .xlsx");
         }
       };
       reader.readAsArrayBuffer(file);
       return;
     }
 
-    // CSV path — uses window.Papa from the CDN script below
+    // CSV path
+    if (!papaReady || !window.Papa) {
+      setParseErr("CSV parser is still loading. Wait a second and choose the file again.");
+      return;
+    }
     window.Papa.parse(file, {
       header: true,
       skipEmptyLines: true,
       transformHeader: (h) => (h || "").trim(),
       complete: ({ data, errors, meta }) => {
         if (errors?.length) {
+          console.error(errors);
           setParseErr(errors[0]?.message || "Parse error");
           return;
         }
-        const hdrs = (meta?.fields || []).map((h) => h.trim());
+        const hdrs = (meta?.fields || []).map((h) => (h || "").trim());
         setHeaders(hdrs);
         setRows(data);
       }
@@ -113,9 +136,17 @@ export default function BulkUploadPage() {
 
   return (
     <>
-      {/* Load parsers (no npm needed) */}
-      <Script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js" strategy="afterInteractive" />
-      <Script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js" strategy="afterInteractive" />
+      {/* Load parsers (no npm) and mark readiness */}
+      <Script
+        src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"
+        strategy="afterInteractive"
+        onLoad={() => setXlsxReady(true)}
+      />
+      <Script
+        src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"
+        strategy="afterInteractive"
+        onLoad={() => setPapaReady(true)}
+      />
 
       <main style={{ padding: "2rem", fontFamily: "sans-serif", maxWidth: 1100, margin: "0 auto" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
@@ -125,6 +156,10 @@ export default function BulkUploadPage() {
             <Link href={`/campaigns/${campaignId}/totals`}>View Totals</Link>
           </div>
         </div>
+
+        <p style={{ color: "#555" }}>
+          Parsers: XLSX <strong>{xlsxReady ? "ready" : "loading…"}</strong> · CSV <strong>{papaReady ? "ready" : "loading…"}</strong>
+        </p>
 
         {/* File picker */}
         <section style={{ border: "1px solid #ddd", padding: 16, borderRadius: 8, marginBottom: 24 }}>
