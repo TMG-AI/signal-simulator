@@ -74,27 +74,111 @@ export default function BulkUploadPage() {
     setLastEvent("");
   }
 
+  // ----------- header detection helpers -----------
+  const HEADER_SYNONYMS = [
+    "vendor","publisher","newspaper","partner","network",
+    "cat","category","channel","media type","placement type",
+    "description","line item","ad set","ad group","notes","creative","campaign line",
+    "unit","measure","kpi unit",
+    "qty","quantity","impressions","imps","grps","spots","circulation",
+    "rate","price","cpm","cpp",
+    "net","cost net","amount","spend","cost","total","total cost","net amount","gross",
+    "geography","geo","market","state","dma","region","city",
+    "audience","target","targeting","segment",
+    "currency","ccy","currency code","iso currency",
+    "fx","fx rate","exchange rate","rate to campaign","fx_rate_to_campaign",
+    "start","end","start date","end date","date"
+  ].map(normalize);
+
+  function normalize(s) {
+    return String(s ?? "")
+      .toLowerCase()
+      .replace(/[\s_]+/g, " ")
+      .replace(/[^a-z0-9 %/+.-]/g, "")
+      .trim();
+  }
+
+  function scoreHeaderRow(cells) {
+    const norm = cells.map(normalize);
+    const nonEmpty = norm.filter((c) => c !== "").length;
+    if (nonEmpty === 0) return -1;
+
+    // hits = cells that look like real column names (short-ish, have letters, match synonyms)
+    let hits = 0;
+    for (const c of norm) {
+      if (!c) continue;
+      if (HEADER_SYNONYMS.includes(c)) { hits += 2; continue; }
+      if (c.length <= 30 && /[a-z]/.test(c)) hits += 1;
+    }
+    // prefer rows with many non-empty cells and many hits
+    return hits * 3 + nonEmpty;
+  }
+
+  function detectHeaderAndBodyFromAOA(aoa) {
+    // scan first 50 rows for the best header candidate
+    const limit = Math.min(50, aoa.length);
+    let bestIdx = -1;
+    let bestScore = -1;
+
+    for (let i = 0; i < limit; i++) {
+      const row = (aoa[i] || []).map((x) => String(x ?? "").trim());
+      const sc = scoreHeaderRow(row);
+      if (sc > bestScore) {
+        bestScore = sc;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx === -1) bestIdx = 0;
+
+    const rawHdrs = (aoa[bestIdx] || []);
+    const hdrs = rawHdrs.map((h, i) => {
+      const n = normalize(h);
+      if (!n) return `col_${i + 1}`;
+      // prettify: Title Case with spaces
+      return n.replace(/\s+/g, " ");
+    });
+
+    // ensure uniqueness
+    const seen = {};
+    for (let i = 0; i < hdrs.length; i++) {
+      let h = hdrs[i];
+      if (!seen[h]) { seen[h] = 1; continue; }
+      seen[h] += 1;
+      hdrs[i] = `${h}_${seen[h]}`;
+    }
+
+    // body from next row onward; drop fully-empty rows
+    const body = [];
+    for (let r = bestIdx + 1; r < aoa.length; r++) {
+      const row = aoa[r] || [];
+      const clean = {};
+      let hasAny = false;
+      for (let c = 0; c < hdrs.length; c++) {
+        const v = row[c];
+        const s = v == null ? "" : String(v).trim();
+        if (s !== "") hasAny = true;
+        clean[hdrs[c]] = s;
+      }
+      if (hasAny) body.push(clean);
+    }
+
+    return { hdrs, body, headerRowIndex: bestIdx };
+  }
+
+  // Fallback for CSV text (run same detection on AoA)
+  function csvTextToAoA(text) {
+    if (!window.Papa) return [[]];
+    const out = window.Papa.parse(text, { header: false, skipEmptyLines: false });
+    return out?.data || [];
+  }
+
   // ------------- helpers -------------
   function parseCSVText(csvText) {
-    if (!window.Papa) {
-      setParseErr("CSV parser isn’t available yet. Hard refresh (Cmd+Shift+R) and reselect the file.");
-      return;
-    }
-    window.Papa.parse(csvText, {
-      header: true,
-      skipEmptyLines: true,
-      transformHeader: (h) => (h || "").trim(),
-      complete: ({ data, errors, meta }) => {
-        if (errors?.length) {
-          setParseErr(errors[0]?.message || "Parse error");
-          return;
-        }
-        const hdrs = (meta?.fields || []).map((h) => (h || "").trim());
-        setHeaders(hdrs);
-        setRows(data);
-        setLastEvent(`CSV parsed: ${data.length} rows`);
-      }
-    });
+    const aoa = csvTextToAoA(csvText);
+    const { hdrs, body, headerRowIndex } = detectHeaderAndBodyFromAOA(aoa);
+    setHeaders(hdrs);
+    setRows(body);
+    setLastEvent(`CSV parsed · header row #${headerRowIndex + 1} · rows=${body.length}`);
   }
 
   // ---------------- Handle file selection (CSV or XLS/XLSX) ----------------
@@ -107,7 +191,7 @@ export default function BulkUploadPage() {
     setFileName(file.name || "");
     const name = (file.name || "").toLowerCase();
 
-    // Excel path (.xlsx or .xls)
+    // Excel path (.xlsx/.xls)
     if (name.endsWith(".xlsx") || name.endsWith(".xls")) {
       if (!window.XLSX) {
         setParseErr("Excel parser isn’t available yet. Hard refresh (Cmd+Shift+R) and reselect the file.");
@@ -117,7 +201,6 @@ export default function BulkUploadPage() {
       const reader = new FileReader();
       reader.onload = (evt) => {
         try {
-          setLastEvent("FileReader loaded (excel)");
           const data = new Uint8Array(evt.target.result);
           const wb = window.XLSX.read(data, { type: "array" });
           const sheetName = wb.SheetNames[0];
@@ -127,38 +210,17 @@ export default function BulkUploadPage() {
           }
           const sheet = wb.Sheets[sheetName];
 
-          // Try AOA (header row in first line)
-          const aoa = window.XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false });
-          const firstRow = aoa[0] || [];
-          const nonEmptyHeaders = firstRow.filter((x) => String(x ?? "").trim() !== "");
-          if (aoa.length && nonEmptyHeaders.length) {
-            const hdrs = firstRow.map((h, i) => {
-              const v = (h ?? "").toString().trim();
-              return v || `Column_${i + 1}`;
-            });
-            const body = aoa
-              .slice(1)
-              .filter((r) => r && r.some((c) => String(c ?? "").trim() !== ""))
-              .map((arr) => {
-                const obj = {};
-                hdrs.forEach((h, i) => (obj[h] = arr[i]));
-                return obj;
-              });
-            setHeaders(hdrs);
-            setRows(body);
-            setLastEvent(`XLSX parsed via AOA: ${body.length} rows`);
+          // Build AoA (no assumption that row 1 is headers)
+          const aoa = window.XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, blankrows: false });
+          if (!aoa || !aoa.length) {
+            setParseErr("Empty spreadsheet.");
             return;
           }
 
-          // Fallback: convert sheet -> CSV then parse with Papa
-          const csv = window.XLSX.utils.sheet_to_csv(sheet);
-          if (!csv || !csv.trim()) {
-            setParseErr("Could not extract data from sheet.");
-            setLastEvent("XLSX fallback CSV empty");
-            return;
-          }
-          parseCSVText(csv);
-          setLastEvent("XLSX parsed via CSV fallback");
+          const { hdrs, body, headerRowIndex } = detectHeaderAndBodyFromAOA(aoa);
+          setHeaders(hdrs);
+          setRows(body);
+          setLastEvent(`XLSX parsed · header row #${headerRowIndex + 1} · rows=${body.length}`);
         } catch (err) {
           setParseErr(err?.message || "Failed to read Excel file.");
           setLastEvent("XLSX read error");
@@ -178,10 +240,9 @@ export default function BulkUploadPage() {
       setLastEvent("Papa not ready");
       return;
     }
-    // Read as text to display better errors if needed
     const reader = new FileReader();
     reader.onload = (evt) => {
-      setLastEvent("FileReader loaded (csv text)");
+      setLastEvent("FileReader loaded (csv)");
       parseCSVText(evt.target.result);
     };
     reader.onerror = () => {
