@@ -1,4 +1,3 @@
-
 import { useRouter } from "next/router";
 import Link from "next/link";
 import { useEffect, useState } from "react";
@@ -19,7 +18,7 @@ export default function BulkUploadPage() {
   const [rows, setRows] = useState([]);
   const [parseErr, setParseErr] = useState("");
 
-  // Auth
+  // ---------------- Auth ----------------
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => setEmail(data.user?.email ?? null));
     const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
@@ -28,7 +27,7 @@ export default function BulkUploadPage() {
     return () => sub.subscription.unsubscribe();
   }, []);
 
-  // Load campaign name
+  // ---------------- Load campaign name ----------------
   useEffect(() => {
     if (!campaignId) return;
     (async () => {
@@ -41,13 +40,39 @@ export default function BulkUploadPage() {
     })();
   }, [campaignId]);
 
+  // ---------------- Ensure parsers are loaded (no npm needed) ----------------
+  useEffect(() => {
+    const XLSX_SRC = "https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js";
+    const PAPA_SRC = "https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js";
+
+    function ensure(src, isReady, onReady) {
+      // already available?
+      if (isReady()) { onReady(); return; }
+
+      // reuse a single <script> per src
+      let el = document.querySelector(`script[data-src="${src}"]`);
+      if (!el) {
+        el = document.createElement("script");
+        el.src = src;
+        el.async = true;
+        el.setAttribute("data-src", src);
+        document.head.appendChild(el);
+      }
+      el.onload = onReady;
+      el.onerror = () => setParseErr(`Failed to load parser: ${src}`);
+    }
+
+    ensure(XLSX_SRC, () => typeof window !== "undefined" && !!window.XLSX, () => setXlsxReady(true));
+    ensure(PAPA_SRC, () => typeof window !== "undefined" && !!window.Papa, () => setPapaReady(true));
+  }, []);
+
   function resetParse() {
     setParseErr("");
     setHeaders([]);
     setRows([]);
   }
 
-  // Handle file selection (CSV or XLSX)
+  // ---------------- Handle file selection (CSV or XLSX) ----------------
   function onFileChange(e) {
     resetParse();
 
@@ -58,8 +83,8 @@ export default function BulkUploadPage() {
 
     // XLSX path
     if (name.endsWith(".xlsx")) {
-      if (!xlsxReady || !window.XLSX) {
-        setParseErr("Excel parser is still loading. Wait a second and choose the file again.");
+      if (!window.XLSX) {
+        setParseErr("Excel parser isn’t available yet. Hard refresh (Cmd+Shift+R) and reselect the file.");
         return;
       }
       const reader = new FileReader();
@@ -103,8 +128,8 @@ export default function BulkUploadPage() {
     }
 
     // CSV path
-    if (!papaReady || !window.Papa) {
-      setParseErr("CSV parser is still loading. Wait a second and choose the file again.");
+    if (!window.Papa) {
+      setParseErr("CSV parser isn’t available yet. Hard refresh (Cmd+Shift+R) and reselect the file.");
       return;
     }
     window.Papa.parse(file, {
@@ -136,8 +161,6 @@ export default function BulkUploadPage() {
 
   return (
     <>
-      {/* Load parsers (no npm) and mark readiness */}
-
       <main style={{ padding: "2rem", fontFamily: "sans-serif", maxWidth: 1100, margin: "0 auto" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
           <h1 style={{ margin: 0 }}>{campaign ? `Bulk Upload — ${campaign.name}` : "Bulk Upload"}</h1>
