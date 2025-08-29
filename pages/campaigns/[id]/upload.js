@@ -1,4 +1,4 @@
-import Script from "next/script";
+
 import { useRouter } from "next/router";
 import Link from "next/link";
 import { useEffect, useState } from "react";
@@ -137,16 +137,6 @@ export default function BulkUploadPage() {
   return (
     <>
       {/* Load parsers (no npm) and mark readiness */}
-      <Script
-        src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"
-        strategy="afterInteractive"
-        onLoad={() => setXlsxReady(true)}
-      />
-      <Script
-        src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"
-        strategy="afterInteractive"
-        onLoad={() => setPapaReady(true)}
-      />
 
       <main style={{ padding: "2rem", fontFamily: "sans-serif", maxWidth: 1100, margin: "0 auto" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
