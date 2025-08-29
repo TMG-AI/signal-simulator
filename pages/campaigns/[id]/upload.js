@@ -18,6 +18,10 @@ export default function BulkUploadPage() {
   const [rows, setRows] = useState([]);
   const [parseErr, setParseErr] = useState("");
 
+  // Debug UI
+  const [fileName, setFileName] = useState("");
+  const [lastEvent, setLastEvent] = useState("");
+
   // ---------------- Auth ----------------
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => setEmail(data.user?.email ?? null));
@@ -46,10 +50,7 @@ export default function BulkUploadPage() {
     const PAPA_SRC = "https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js";
 
     function ensure(src, isReady, onReady) {
-      // already available?
       if (isReady()) { onReady(); return; }
-
-      // reuse a single <script> per src
       let el = document.querySelector(`script[data-src="${src}"]`);
       if (!el) {
         el = document.createElement("script");
@@ -70,58 +71,102 @@ export default function BulkUploadPage() {
     setParseErr("");
     setHeaders([]);
     setRows([]);
+    setLastEvent("");
   }
 
-  // ---------------- Handle file selection (CSV or XLSX) ----------------
+  // ------------- helpers -------------
+  function parseCSVText(csvText) {
+    if (!window.Papa) {
+      setParseErr("CSV parser isn’t available yet. Hard refresh (Cmd+Shift+R) and reselect the file.");
+      return;
+    }
+    window.Papa.parse(csvText, {
+      header: true,
+      skipEmptyLines: true,
+      transformHeader: (h) => (h || "").trim(),
+      complete: ({ data, errors, meta }) => {
+        if (errors?.length) {
+          setParseErr(errors[0]?.message || "Parse error");
+          return;
+        }
+        const hdrs = (meta?.fields || []).map((h) => (h || "").trim());
+        setHeaders(hdrs);
+        setRows(data);
+        setLastEvent(`CSV parsed: ${data.length} rows`);
+      }
+    });
+  }
+
+  // ---------------- Handle file selection (CSV or XLS/XLSX) ----------------
   function onFileChange(e) {
     resetParse();
 
     const file = e.target.files?.[0];
-    if (!file) return;
+    if (!file) { setLastEvent("No file in event"); return; }
 
+    setFileName(file.name || "");
     const name = (file.name || "").toLowerCase();
 
-    // XLSX path
-    if (name.endsWith(".xlsx")) {
+    // Excel path (.xlsx or .xls)
+    if (name.endsWith(".xlsx") || name.endsWith(".xls")) {
       if (!window.XLSX) {
         setParseErr("Excel parser isn’t available yet. Hard refresh (Cmd+Shift+R) and reselect the file.");
+        setLastEvent("XLSX not ready");
         return;
       }
       const reader = new FileReader();
       reader.onload = (evt) => {
         try {
+          setLastEvent("FileReader loaded (excel)");
           const data = new Uint8Array(evt.target.result);
           const wb = window.XLSX.read(data, { type: "array" });
-          const sheet = wb.Sheets[wb.SheetNames[0]];
-          const aoa = window.XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false }); // array of arrays
+          const sheetName = wb.SheetNames[0];
+          if (!sheetName) {
+            setParseErr("No sheets found in workbook.");
+            return;
+          }
+          const sheet = wb.Sheets[sheetName];
 
-          if (!aoa.length) {
-            setParseErr("Empty spreadsheet.");
+          // Try AOA (header row in first line)
+          const aoa = window.XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false });
+          const firstRow = aoa[0] || [];
+          const nonEmptyHeaders = firstRow.filter((x) => String(x ?? "").trim() !== "");
+          if (aoa.length && nonEmptyHeaders.length) {
+            const hdrs = firstRow.map((h, i) => {
+              const v = (h ?? "").toString().trim();
+              return v || `Column_${i + 1}`;
+            });
+            const body = aoa
+              .slice(1)
+              .filter((r) => r && r.some((c) => String(c ?? "").trim() !== ""))
+              .map((arr) => {
+                const obj = {};
+                hdrs.forEach((h, i) => (obj[h] = arr[i]));
+                return obj;
+              });
+            setHeaders(hdrs);
+            setRows(body);
+            setLastEvent(`XLSX parsed via AOA: ${body.length} rows`);
             return;
           }
 
-          // Build headers (give defaults if a header cell is blank)
-          const hdrs = (aoa[0] || []).map((h, i) => {
-            const v = (h ?? "").toString().trim();
-            return v || `Column_${i + 1}`;
-          });
-
-          // Rows -> array of objects keyed by header
-          const body = aoa
-            .slice(1)
-            .filter((r) => r && r.some((c) => String(c ?? "").trim() !== ""))
-            .map((arr) => {
-              const obj = {};
-              hdrs.forEach((h, i) => (obj[h] = arr[i]));
-              return obj;
-            });
-
-          setHeaders(hdrs);
-          setRows(body);
+          // Fallback: convert sheet -> CSV then parse with Papa
+          const csv = window.XLSX.utils.sheet_to_csv(sheet);
+          if (!csv || !csv.trim()) {
+            setParseErr("Could not extract data from sheet.");
+            setLastEvent("XLSX fallback CSV empty");
+            return;
+          }
+          parseCSVText(csv);
+          setLastEvent("XLSX parsed via CSV fallback");
         } catch (err) {
-          console.error(err);
-          setParseErr(err?.message || "Failed to read .xlsx");
+          setParseErr(err?.message || "Failed to read Excel file.");
+          setLastEvent("XLSX read error");
         }
+      };
+      reader.onerror = () => {
+        setParseErr("Failed to read file (FileReader error).");
+        setLastEvent("FileReader onerror");
       };
       reader.readAsArrayBuffer(file);
       return;
@@ -130,23 +175,20 @@ export default function BulkUploadPage() {
     // CSV path
     if (!window.Papa) {
       setParseErr("CSV parser isn’t available yet. Hard refresh (Cmd+Shift+R) and reselect the file.");
+      setLastEvent("Papa not ready");
       return;
     }
-    window.Papa.parse(file, {
-      header: true,
-      skipEmptyLines: true,
-      transformHeader: (h) => (h || "").trim(),
-      complete: ({ data, errors, meta }) => {
-        if (errors?.length) {
-          console.error(errors);
-          setParseErr(errors[0]?.message || "Parse error");
-          return;
-        }
-        const hdrs = (meta?.fields || []).map((h) => (h || "").trim());
-        setHeaders(hdrs);
-        setRows(data);
-      }
-    });
+    // Read as text to display better errors if needed
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      setLastEvent("FileReader loaded (csv text)");
+      parseCSVText(evt.target.result);
+    };
+    reader.onerror = () => {
+      setParseErr("Failed to read file (FileReader error).");
+      setLastEvent("FileReader onerror (csv)");
+    };
+    reader.readAsText(file);
   }
 
   if (!email) {
@@ -178,14 +220,19 @@ export default function BulkUploadPage() {
         <section style={{ border: "1px solid #ddd", padding: 16, borderRadius: 8, marginBottom: 24 }}>
           <h2 style={{ marginTop: 0 }}>Choose a file</h2>
           <p style={{ color: "#555", marginTop: 6 }}>
-            Supports <strong>.xlsx</strong> and <strong>.csv</strong>. After selecting, you’ll see a preview below.
+            Supports <strong>.xlsx/.xls</strong> and <strong>.csv</strong>. After selecting, you’ll see a preview below.
           </p>
           <input
+            key={`${xlsxReady}-${papaReady}`}     // remount input after parsers load
             type="file"
-            accept=".csv, text/csv, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, .xlsx"
+            accept=".csv, text/csv, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, .xlsx, .xls"
             onChange={onFileChange}
+            onClick={(e) => { e.currentTarget.value = null; }} // allow re-selecting the same file
           />
           {parseErr && <p style={{ color: "crimson", marginTop: 10 }}>{parseErr}</p>}
+          <div style={{ marginTop: 8, color: "#666", fontSize: 12 }}>
+            Debug: file=<strong>{fileName || "—"}</strong> · {lastEvent || "no events yet"} · headers={headers.length} · rows={rows.length}
+          </div>
         </section>
 
         {/* Preview */}
