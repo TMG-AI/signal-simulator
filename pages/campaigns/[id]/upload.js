@@ -10,25 +10,34 @@ export default function BulkUploadPage() {
   const [email, setEmail] = useState(null);
   const [campaign, setCampaign] = useState(null);
 
-  // Parsers + raw parse
+  // Parser readiness
   const [xlsxReady, setXlsxReady] = useState(false);
   const [papaReady, setPapaReady] = useState(false);
-  const [rawAoA, setRawAoA] = useState([]);     // raw sheet as array-of-arrays
+  const [cpexReady, setCpexReady] = useState(false); // legacy .xls encodings
+
+  // Workbook / sheet
+  const [fileName, setFileName] = useState("");
+  const [sheetNames, setSheetNames] = useState([]);
+  const [sheetsAoA, setSheetsAoA] = useState({}); // {sheetName: AoA}
+  const [selectedSheet, setSelectedSheet] = useState("");
+
+  // Current sheet (raw) + parsed
+  const [rawAoA, setRawAoA] = useState([]);
   const [headers, setHeaders] = useState([]);
   const [rows, setRows] = useState([]);
-  const [parseErr, setParseErr] = useState("");
 
-  // Start-cell override
-  const [startRow, setStartRow] = useState(""); // 1-based
-  const [startCol, setStartCol] = useState(""); // letters, e.g. A, B, AA
+  // Overrides
+  const [startRow, setStartRow] = useState("");        // 1-based
+  const [startCol, setStartCol] = useState("");        // letters (A, B, AA…)
+  const [manualHeaderRow, setManualHeaderRow] = useState(""); // 1-based within trimmed area
 
-  // Auto-mapped output (canonical)
+  // Auto-mapped output (focused on your 4 fields + a few helpful columns)
   const CANONICAL = ["vendor","geography","ad_size","cost_net","cat","description","unit","quantity","currency","fx_rate_to_campaign","audience_descriptor"];
   const [mappedRows, setMappedRows] = useState([]);
   const [issues, setIssues] = useState([]);
 
-  // UI debug / insert
-  const [fileName, setFileName] = useState("");
+  // UI
+  const [parseErr, setParseErr] = useState("");
   const [lastEvent, setLastEvent] = useState("");
   const [inserting, setInserting] = useState(false);
   const [insertMsg, setInsertMsg] = useState("");
@@ -57,6 +66,7 @@ export default function BulkUploadPage() {
 
   // ---------- Load parsers (no npm) ----------
   useEffect(() => {
+    const CPEX_SRC = "https://cdn.jsdelivr.net/npm/xlsx/dist/cpexcel.full.min.js";
     const XLSX_SRC = "https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js";
     const PAPA_SRC = "https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js";
 
@@ -71,24 +81,32 @@ export default function BulkUploadPage() {
         document.head.appendChild(el);
       }
       el.onload = onReady;
-      el.onerror = () => setParseErr(`Failed to load parser: ${src}`);
+      el.onerror = () => setParseErr((p) => p || `Failed to load parser: ${src}`);
     }
 
-    ensure(XLSX_SRC, () => typeof window !== "undefined" && !!window.XLSX, () => setXlsxReady(true));
-    ensure(PAPA_SRC, () => typeof window !== "undefined" && !!window.Papa, () => setPapaReady(true));
+    // Load cpexcel first so XLSX can decode older .xls encodings
+    ensure(CPEX_SRC, () => !!window.cptable, () => setCpexReady(true));
+    ensure(XLSX_SRC, () => !!window.XLSX, () => setXlsxReady(true));
+    ensure(PAPA_SRC, () => !!window.Papa, () => setPapaReady(true));
   }, []);
 
   // ---------- utils ----------
-  function resetParse() {
-    setParseErr(""); setHeaders([]); setRows([]); setMappedRows([]);
-    setIssues([]); setInsertMsg(""); setLastEvent(""); setRawAoA([]);
+  function resetAll() {
+    setParseErr("");
+    setSheetNames([]); setSheetsAoA({}); setSelectedSheet("");
+    setRawAoA([]); setHeaders([]); setRows([]); setMappedRows([]);
+    setIssues([]); setInsertMsg(""); setLastEvent("");
+    setStartRow(""); setStartCol(""); setManualHeaderRow("");
   }
   const norm = (s) => String(s ?? "").trim().toLowerCase();
   const nonEmpty = (s) => (s ?? "").toString().trim() !== "";
   function toNumberLoose(v) {
     if (v === undefined || v === null || v === "") return NaN;
-    const cleaned = String(v).replace(/[$, ]/g, "");
-    return Number(cleaned);
+    // handle $(1,234.56) and (1,234.56)
+    const neg = /^\(.*\)$/.test(String(v));
+    const cleaned = String(v).replace(/[()$,\s]/g, "");
+    const n = Number(cleaned);
+    return neg ? -n : n;
   }
   const nullableStr = (v) => {
     const s = v == null ? "" : String(v).trim();
@@ -106,10 +124,10 @@ export default function BulkUploadPage() {
   const HEADER_SYNONYMS = [
     "vendor","publisher","newspaper","partner","network","seller","paper",
     "cat","category","channel","media type","placement type",
-    "description","line item","edition","editions","order",
+    "description","line item","edition","editions","order","program",
     "unit","measure","kpi unit","size","ad size",
     "qty","quantity","impressions","imps","grps","spots","circulation","ins","insertions",
-    "rate","price","cpm","cpp","inch rate","color charge","open national","net per unit",
+    "rate","price","cpm","cpp","inch rate","color charge","open national","net per unit","unit cost",
     "net","cost net","amount","spend","cost","total","total cost","net amount","gross",
     "geography","geo","market","state","dma","region","city",
     "audience","target","segment",
@@ -131,15 +149,20 @@ export default function BulkUploadPage() {
     return hits * 3 + filled;
   }
 
-  function detectHeaderAndBodyFromAOA(aoa) {
-    const limit = Math.min(50, aoa.length);
-    let bestIdx = -1, bestScore = -1;
-    for (let i = 0; i < limit; i++) {
-      const row = (aoa[i] || []).map((x) => String(x ?? "").trim());
-      const sc = scoreHeaderRow(row);
-      if (sc > bestScore) { bestScore = sc; bestIdx = i; }
+  function detectHeaderAndBodyFromAOA(aoa, headerRowOverride /* 1-based */) {
+    let bestIdx = -1;
+    if (headerRowOverride && Number(headerRowOverride) >= 1) {
+      bestIdx = Number(headerRowOverride) - 1;
+    } else {
+      const limit = Math.min(50, aoa.length);
+      let bestScore = -1;
+      for (let i = 0; i < limit; i++) {
+        const row = (aoa[i] || []).map((x) => String(x ?? "").trim());
+        const sc = scoreHeaderRow(row);
+        if (sc > bestScore) { bestScore = sc; bestIdx = i; }
+      }
+      if (bestIdx === -1) bestIdx = 0;
     }
-    if (bestIdx === -1) bestIdx = 0;
 
     const rawHdrs = aoa[bestIdx] || [];
     const hdrs = rawHdrs.map((h, i) => {
@@ -147,7 +170,7 @@ export default function BulkUploadPage() {
       return t || `col_${i + 1}`;
     });
 
-    // uniqueness
+    // ensure uniqueness
     const seen = {};
     for (let i = 0; i < hdrs.length; i++) {
       const h = hdrs[i];
@@ -166,10 +189,10 @@ export default function BulkUploadPage() {
       }
       if (hasAny) body.push(o);
     }
-    return { hdrs, body, headerRowIndex: bestIdx };
+    return { hdrs, body, headerRowIndex: bestIdx + 1 };
   }
 
-  // ---------- vendor-type detection (to set cat) ----------
+  // ---------- vendor-type detection (sets cat + math rules) ----------
   function detectVendorType(hdrs) {
     const H = hdrs.map(norm);
     const any = (...arr) => arr.some((t) => H.includes(t));
@@ -193,10 +216,12 @@ export default function BulkUploadPage() {
     const hVendor   = byNorm["newspaper"] || byNorm["publisher"] || byNorm["vendor"] || byNorm["paper"] || hdrs[0];
     const hMarket   = byNorm["market"] || byNorm["city"] || byNorm["dma"] || byNorm["region"];
     const hState    = byNorm["state"];
-    const hSize     = byNorm["ad size"] || byNorm["size"]; // common in newspaper sheets
-    const hIns      = byNorm["ins"] || byNorm["insertions"] || byNorm["qty"] || byNorm["quantity"];
-    const hTotal    = byNorm["total"] || byNorm["net"] || byNorm["cost net"] || byNorm["amount"] || byNorm["total cost"];
-    const hNPU      = byNorm["net per unit"] || byNorm["rate"] || byNorm["price"] || byNorm["inch rate"];
+    const hSize     = byNorm["ad size"] || byNorm["size"];
+    const hIns      = byNorm["ins"] || byNorm["insertions"] || byNorm["qty"] || byNorm["quantity"] || byNorm["spots"];
+    const hTotal    = byNorm["total"] || byNorm["total cost"] || byNorm["net"] || byNorm["cost net"] || byNorm["amount"];
+    const hNPU      = byNorm["net per unit"] || byNorm["rate"] || byNorm["price"] || byNorm["inch rate"] || byNorm["cpp"] || byNorm["cpm"];
+    const hImps     = byNorm["impressions"] || byNorm["imps"];
+    const hGRPs     = byNorm["grps"];
     const hCurrency = byNorm["currency"] || byNorm["ccy"];
     const hFX       = byNorm["fx_rate_to_campaign"] || byNorm["fx rate"] || byNorm["exchange rate"];
 
@@ -209,21 +234,44 @@ export default function BulkUploadPage() {
       const vendor = String(r[hVendor] ?? "").trim();
       if (!vendor) { problems.push(`Row ${i + 1}: vendor missing`); continue; }
 
+      // quantities + totals (handle multiple media maths)
       const qty = hIns ? Number(String(r[hIns]).replace(/[, ]/g, "")) : null;
 
       let total = hTotal ? toNumberLoose(r[hTotal]) : NaN;
+
+      // DIGITAL: CPM × impressions / 1000
+      if (!Number.isFinite(total) || total === 0) {
+        const cpm = byNorm["cpm"] ? toNumberLoose(r[byNorm["cpm"]]) : NaN;
+        const imps = hImps ? Number(String(r[hImps]).replace(/[, ]/g, "")) : NaN;
+        if (Number.isFinite(cpm) && Number.isFinite(imps)) total = (cpm * imps) / 1000;
+      }
+      // PRINT: net per unit × insertions
       if (!Number.isFinite(total) || total === 0) {
         const npu = hNPU ? toNumberLoose(r[hNPU]) : NaN;
-        if (Number.isFinite(npu) && qty !== null && Number.isFinite(qty)) total = npu * qty;
+        if (Number.isFinite(npu) && Number.isFinite(qty)) total = npu * qty;
       }
+      // BROADCAST: CPP × GRPs or rate × spots
+      if (!Number.isFinite(total) || total === 0) {
+        const cpp = byNorm["cpp"] ? toNumberLoose(r[byNorm["cpp"]]) : NaN;
+        const grps = hGRPs ? Number(String(r[hGRPs]).replace(/[, ]/g, "")) : NaN;
+        if (Number.isFinite(cpp) && Number.isFinite(grps)) total = cpp * grps;
+        if (!Number.isFinite(total) || total === 0) {
+          const rate = byNorm["rate"] ? toNumberLoose(r[byNorm["rate"]]) : NaN;
+          if (Number.isFinite(rate) && Number.isFinite(qty)) total = rate * qty;
+        }
+      }
+
       if (!Number.isFinite(total) || total < 0) { problems.push(`Row ${i + 1}: cost not found`); continue; }
 
       let geography = null;
       if (nonEmpty(r[hMarket])) geography = r[hMarket];
       if (nonEmpty(r[hState])) geography = geography ? `${geography}, ${r[hState]}` : r[hState];
 
-      const ad_size = nullableStr(r[hSize]) || null; // <- what you asked to see
-      const unit = t === "PRINT_NEWS" ? "insertions" : null;
+      const ad_size = nullableStr(r[hSize]) || null;
+      let unit = null;
+      if (t === "PRINT_NEWS") unit = "insertions";
+      else if (t === "DIGITAL" && hImps) unit = "impressions";
+      else if (t === "BROADCAST" && (byNorm["spots"] || byNorm["grps"])) unit = byNorm["spots"] ? "spots" : "GRPs";
 
       const currency = nullableStr(r[hCurrency]);
       const fx = r[hFX] ? Number(String(r[hFX]).replace(/[, ]/g, "")) : null;
@@ -233,7 +281,7 @@ export default function BulkUploadPage() {
         geography,
         ad_size,
         cost_net: total,
-        cat: catDefault,
+        cat: inferredCatForType(t),
         description: ad_size ? `Size: ${ad_size}` : null,
         unit,
         quantity: qty ?? null,
@@ -247,29 +295,25 @@ export default function BulkUploadPage() {
     setIssues(problems);
   }
 
-  // ---------- apply start-cell override to rawAoA ----------
-  function applyStartOverride() {
-    if (!rawAoA?.length) return;
-    const r = Number(startRow) || 1;
-    const c = colLettersToIndex(startCol || "A"); // 1-based
-    const trimmed = rawAoA.slice(Math.max(0, r - 1)).map((row) => row.slice(Math.max(0, c - 1)));
-    const { hdrs, body, headerRowIndex } = detectHeaderAndBodyFromAOA(trimmed);
+  // ---------- recompute (sheet + start/header overrides) ----------
+  function recomputeFromAoA(baseAoA) {
+    if (!baseAoA?.length) { setHeaders([]); setRows([]); setMappedRows([]); return; }
+    const sr = Number(startRow) || 1;
+    const sc = colLettersToIndex(startCol || "A");
+    const trimmed = baseAoA.slice(Math.max(0, sr - 1)).map((row) => row.slice(Math.max(0, sc - 1)));
+
+    const { hdrs, body, headerRowIndex } = detectHeaderAndBodyFromAOA(
+      trimmed,
+      manualHeaderRow ? Number(manualHeaderRow) : undefined
+    );
     setHeaders(hdrs); setRows(body);
-    setLastEvent(`Applied start cell: row ${r}, col ${c} (header row in trimmed AoA = ${headerRowIndex + 1})`);
-    autoMap(hdrs, body);
-  }
-  function clearStartOverride() {
-    setStartRow(""); setStartCol("");
-    if (!rawAoA?.length) return;
-    const { hdrs, body, headerRowIndex } = detectHeaderAndBodyFromAOA(rawAoA);
-    setHeaders(hdrs); setRows(body);
-    setLastEvent(`Cleared start cell (header row #${headerRowIndex + 1})`);
+    setLastEvent(`Applied start: row ${sr}, col ${sc} · header row (within trimmed) = ${headerRowIndex}`);
     autoMap(hdrs, body);
   }
 
   // ---------- file selection ----------
   function onFileChange(e) {
-    resetParse();
+    resetAll();
     const file = e.target.files?.[0];
     if (!file) { setLastEvent("No file in event"); return; }
 
@@ -284,16 +328,23 @@ export default function BulkUploadPage() {
         try {
           const data = new Uint8Array(evt.target.result);
           const wb = window.XLSX.read(data, { type: "array" });
-          const sheetName = wb.SheetNames[0];
-          if (!sheetName) { setParseErr("No sheets found."); return; }
-          const sheet = wb.Sheets[sheetName];
-          const aoa = window.XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, blankrows: false });
-          if (!aoa?.length) { setParseErr("Empty spreadsheet."); return; }
-          setRawAoA(aoa);
-          // initial parse without override
-          const { hdrs, body, headerRowIndex } = detectHeaderAndBodyFromAOA(aoa);
+          const names = wb.SheetNames || [];
+          const map = {};
+          names.forEach((n) => {
+            const sheet = wb.Sheets[n];
+            const aoa = window.XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, blankrows: false, defval: "" });
+            map[n] = aoa;
+          });
+          setSheetNames(names);
+          setSheetsAoA(map);
+          const first = names[0];
+          setSelectedSheet(first || "");
+          const base = map[first] || [];
+          setRawAoA(base);
+          // initial parse without overrides
+          const { hdrs, body, headerRowIndex } = detectHeaderAndBodyFromAOA(base);
           setHeaders(hdrs); setRows(body);
-          setLastEvent(`XLSX parsed · header row #${headerRowIndex + 1} · rows=${body.length}`);
+          setLastEvent(`Sheet "${first}" · header row #${headerRowIndex} · rows=${body.length}`);
           autoMap(hdrs, body);
         } catch (err) {
           setParseErr(err?.message || "Failed to read Excel file.");
@@ -304,19 +355,49 @@ export default function BulkUploadPage() {
     }
 
     // CSV
-    if (!window.Papa) { setParseErr("CSV parser isn’t available yet. Hard refresh."); return; }
-    const reader = new FileReader();
-    reader.onload = (evt) => {
-      const text = evt.target.result;
-      const parsed = window.Papa.parse(text, { header: false, skipEmptyLines: false });
-      const aoa = parsed?.data || [];
-      setRawAoA(aoa);
-      const { hdrs, body, headerRowIndex } = detectHeaderAndBodyFromAOA(aoa);
-      setHeaders(hdrs); setRows(body);
-      setLastEvent(`CSV parsed · header row #${headerRowIndex + 1} · rows=${body.length}`);
-      autoMap(hdrs, body);
-    };
-    reader.readAsText(file);
+    if (name.endsWith(".csv")) {
+      if (!window.Papa) { setParseErr("CSV parser isn’t available yet. Hard refresh."); return; }
+      const reader = new FileReader();
+      reader.onload = (evt) => {
+        const text = evt.target.result;
+        const parsed = window.Papa.parse(text, { header: false, skipEmptyLines: false });
+        const aoa = parsed?.data || [];
+        setSheetNames(["CSV"]);
+        setSheetsAoA({ CSV: aoa });
+        setSelectedSheet("CSV");
+        setRawAoA(aoa);
+        const { hdrs, body, headerRowIndex } = detectHeaderAndBodyFromAOA(aoa);
+        setHeaders(hdrs); setRows(body);
+        setLastEvent(`CSV · header row #${headerRowIndex} · rows=${body.length}`);
+        autoMap(hdrs, body);
+      };
+      reader.readAsText(file);
+      return;
+    }
+
+    setParseErr("Unsupported file type. Use .xls, .xlsx, or .csv.");
+  }
+
+  // when sheet changes, recompute with current overrides
+  useEffect(() => {
+    if (!selectedSheet) return;
+    const base = sheetsAoA[selectedSheet] || [];
+    setRawAoA(base);
+    if (base.length) recomputeFromAoA(base);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSheet]);
+
+  function applyStart() {
+    if (!rawAoA.length) return;
+    recomputeFromAoA(rawAoA);
+  }
+  function clearStart() {
+    setStartRow(""); setStartCol(""); setManualHeaderRow("");
+    if (!rawAoA.length) return;
+    const { hdrs, body, headerRowIndex } = detectHeaderAndBodyFromAOA(rawAoA);
+    setHeaders(hdrs); setRows(body);
+    setLastEvent(`Cleared overrides · header row #${headerRowIndex} · rows=${body.length}`);
+    autoMap(hdrs, body);
   }
 
   // ---------- insert ----------
@@ -365,63 +446,83 @@ export default function BulkUploadPage() {
         </div>
 
         <p style={{ color: "#555" }}>
-          Parsers: XLSX <strong>{xlsxReady ? "ready" : "loading…"}</strong> · CSV <strong>{papaReady ? "ready" : "loading…"}</strong>
+          Parsers: XLSX <strong>{xlsxReady ? "ready" : "loading…"}</strong> ·
+          {" "}CSV <strong>{papaReady ? "ready" : "loading…"}</strong> ·
+          {" "}XLS (codepage) <strong>{cpexReady ? "ready" : "loading…"}</strong>
         </p>
 
         {/* File picker */}
         <section style={{ border: "1px solid #ddd", padding: 16, borderRadius: 8, marginBottom: 16 }}>
           <h2 style={{ marginTop: 0 }}>Choose a file</h2>
-          <p style={{ color: "#555", marginTop: 6 }}>
-            Supports <strong>.xlsx/.xls</strong> and <strong>.csv</strong>.
-          </p>
           <input
-            key={`${xlsxReady}-${papaReady}`}
             type="file"
-            accept=".csv, text/csv, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, .xlsx, .xls"
+            accept=".csv, text/csv, application/vnd.ms-excel, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, .xls, .xlsx"
             onChange={onFileChange}
             onClick={(e) => { e.currentTarget.value = null; }}
           />
           {parseErr && <p style={{ color: "crimson", marginTop: 10 }}>{parseErr}</p>}
           <div style={{ marginTop: 8, color: "#666", fontSize: 12 }}>
-            Debug: file=<strong>{fileName || "—"}</strong> · {lastEvent || "no events yet"} · rawAoA={rawAoA.length}
+            Debug: file=<strong>{fileName || "—"}</strong> · sheets={sheetNames.length} · rows(raw)={rawAoA.length} · {lastEvent || "—"}
           </div>
         </section>
 
-        {/* Start cell override */}
+        {/* Sheet picker */}
+        {sheetNames.length > 1 && (
+          <section style={{ border: "1px solid #ddd", padding: 16, borderRadius: 8, marginBottom: 16 }}>
+            <h2 style={{ marginTop: 0 }}>Pick a sheet</h2>
+            <select
+              value={selectedSheet}
+              onChange={(e) => setSelectedSheet(e.target.value)}
+              style={{ padding: 8, border: "1px solid #ccc", borderRadius: 6 }}
+            >
+              {sheetNames.map((n) => <option key={n} value={n}>{n}</option>)}
+            </select>
+          </section>
+        )}
+
+        {/* Start + header override */}
         {rawAoA.length > 0 && (
           <section style={{ border: "1px solid #ddd", padding: 16, borderRadius: 8, marginBottom: 16 }}>
             <h2 style={{ marginTop: 0 }}>If your sheet has cover text, set where the table starts</h2>
             <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
               <label>Start row&nbsp;
-                <input
-                  type="number" min="1" value={startRow}
-                  onChange={(e) => setStartRow(e.target.value)}
-                  style={{ width: 100, padding: 8, border: "1px solid #ccc", borderRadius: 6 }}
-                  placeholder="e.g. 7"
-                />
+                <input type="number" min="1" value={startRow} onChange={(e) => setStartRow(e.target.value)}
+                       placeholder="e.g. 16" style={{ width: 100, padding: 8, border: "1px solid #ccc", borderRadius: 6 }} />
               </label>
               <label>Start column&nbsp;
-                <input
-                  value={startCol}
-                  onChange={(e) => setStartCol(e.target.value)}
-                  style={{ width: 100, padding: 8, border: "1px solid #ccc", borderRadius: 6, textTransform: "uppercase" }}
-                  placeholder="e.g. B or AA"
-                />
+                <input value={startCol} onChange={(e) => setStartCol(e.target.value)}
+                       placeholder="e.g. A or AA" style={{ width: 100, padding: 8, border: "1px solid #ccc", borderRadius: 6, textTransform: "uppercase" }} />
               </label>
-              <button onClick={applyStartOverride} style={{ padding: "8px 12px", borderRadius: 6, border: "1px solid #999" }}>
-                Apply start
-              </button>
-              <button onClick={clearStartOverride} style={{ padding: "8px 12px", borderRadius: 6, border: "1px solid #999" }}>
-                Clear
-              </button>
+              <label>Header row (within trimmed)&nbsp;
+                <input type="number" min="1" value={manualHeaderRow} onChange={(e) => setManualHeaderRow(e.target.value)}
+                       placeholder="optional" style={{ width: 120, padding: 8, border: "1px solid #ccc", borderRadius: 6 }} />
+              </label>
+              <button onClick={applyStart} style={{ padding: "8px 12px", borderRadius: 6, border: "1px solid #999" }}>Apply start</button>
+              <button onClick={clearStart} style={{ padding: "8px 12px", borderRadius: 6, border: "1px solid #999" }}>Clear</button>
             </div>
-            <p style={{ marginTop: 8, color: "#666" }}>
-              Tip: Use the vendor’s header cell (row/col) – we’ll detect the exact header line under that area.
-            </p>
+
+            {/* Raw grid (first 20 rows) */}
+            <div style={{ marginTop: 12, color: "#555" }}>Raw grid preview (first 20 rows of current sheet):</div>
+            <div style={{ maxHeight: 260, overflow: "auto", border: "1px solid #eee", borderRadius: 6, marginTop: 6 }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                <tbody>
+                  {(rawAoA || []).slice(0, 20).map((r, ri) => (
+                    <tr key={ri}>
+                      <td style={{ borderRight: "1px solid #eee", padding: 4, color: "#888" }}>{ri + 1}</td>
+                      {r.map((c, ci) => (
+                        <td key={ci} style={{ borderBottom: "1px solid #f6f6f6", padding: 4 }}>
+                          {String(c ?? "")}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </section>
         )}
 
-        {/* Mapped Preview (focus on the 4 fields you want) */}
+        {/* Mapped Preview */}
         <section style={{ border: "1px solid #ddd", padding: 16, borderRadius: 8 }}>
           <h2 style={{ marginTop: 0 }}>Mapped Preview (automatic)</h2>
           {mappedRows.length === 0 ? (
@@ -430,7 +531,7 @@ export default function BulkUploadPage() {
             <>
               {issues.length > 0 ? (
                 <p style={{ color: "crimson" }}>
-                  {issues.length} issue(s) detected. First 3: {issues.slice(0,3).join(" | ")}
+                  {issues.length} issue(s). First 3: {issues.slice(0,3).join(" | ")}
                 </p>
               ) : (
                 <p style={{ color: "green" }}>All checks passed.</p>
@@ -439,20 +540,15 @@ export default function BulkUploadPage() {
                 <table style={{ width: "100%", borderCollapse: "collapse" }}>
                   <thead>
                     <tr>
-                      {/* show the four first */}
-                      {["vendor","geography","ad_size","cost_net"].map((h) => (
-                        <th key={h} style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: 8 }}>{h}</th>
-                      ))}
-                      {/* keep the rest (hidden columns can be useful later) */}
-                      {["cat","description","unit","quantity","currency","fx_rate_to_campaign","audience_descriptor"].map((h) => (
+                      {CANONICAL.map((h) => (
                         <th key={h} style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: 8 }}>{h}</th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
-                    {mappedRows.slice(0, 10).map((r, i) => (
+                    {mappedRows.slice(0, 12).map((r, i) => (
                       <tr key={i}>
-                        {["vendor","geography","ad_size","cost_net","cat","description","unit","quantity","currency","fx_rate_to_campaign","audience_descriptor"].map((h) => (
+                        {CANONICAL.map((h) => (
                           <td key={h} style={{ borderBottom: "1px solid #f6f6f6", padding: 8 }}>
                             {h === "cost_net"
                               ? (Number.isFinite(r[h]) ? Number(r[h]).toLocaleString(undefined, { style: "currency", currency: campaign?.currency || "USD" }) : "—")
