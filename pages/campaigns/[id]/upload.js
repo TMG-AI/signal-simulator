@@ -21,8 +21,9 @@ export default function BulkUploadPage() {
   const [sheetsAoA, setSheetsAoA] = useState({}); // {sheetName: AoA}
   const [selectedSheet, setSelectedSheet] = useState("");
 
-  // Current sheet (raw) + parsed
-  const [rawAoA, setRawAoA] = useState([]);
+  // Current sheet (raw & trimmed) + parsed
+  const [rawAoA, setRawAoA] = useState([]);        // AoA before overrides
+  const [trimmedAoA, setTrimmedAoA] = useState([]); // AoA after Start row/col
   const [headers, setHeaders] = useState([]);
   const [rows, setRows] = useState([]);
 
@@ -31,8 +32,11 @@ export default function BulkUploadPage() {
   const [startCol, setStartCol] = useState("");        // letters (A, B, AA…)
   const [manualHeaderRow, setManualHeaderRow] = useState(""); // 1-based within trimmed area
 
-  // Auto-mapped output (focused on your 4 fields + a few helpful columns)
-  const CANONICAL = ["vendor","geography","ad_size","cost_net","cat","description","unit","quantity","currency","fx_rate_to_campaign","audience_descriptor"];
+  // Auto-mapped output (focus on vendor, geography, ad_size, cost_net + helpers)
+  const CANONICAL = [
+    "vendor","geography","ad_size","cost_net","cat",
+    "description","unit","quantity","currency","fx_rate_to_campaign","audience_descriptor"
+  ];
   const [mappedRows, setMappedRows] = useState([]);
   const [issues, setIssues] = useState([]);
 
@@ -94,7 +98,7 @@ export default function BulkUploadPage() {
   function resetAll() {
     setParseErr("");
     setSheetNames([]); setSheetsAoA({}); setSelectedSheet("");
-    setRawAoA([]); setHeaders([]); setRows([]); setMappedRows([]);
+    setRawAoA([]); setTrimmedAoA([]); setHeaders([]); setRows([]); setMappedRows([]);
     setIssues([]); setInsertMsg(""); setLastEvent("");
     setStartRow(""); setStartCol(""); setManualHeaderRow("");
   }
@@ -102,8 +106,8 @@ export default function BulkUploadPage() {
   const nonEmpty = (s) => (s ?? "").toString().trim() !== "";
   function toNumberLoose(v) {
     if (v === undefined || v === null || v === "") return NaN;
-    // handle $(1,234.56) and (1,234.56)
-    const neg = /^\(.*\)$/.test(String(v));
+    // handle negatives like (1,234.56) or $(1,234.56)
+    const neg = /^\s*\(.*\)\s*$/.test(String(v));
     const cleaned = String(v).replace(/[()$,\s]/g, "");
     const n = Number(cleaned);
     return neg ? -n : n;
@@ -170,7 +174,7 @@ export default function BulkUploadPage() {
       return t || `col_${i + 1}`;
     });
 
-    // ensure uniqueness
+    // uniqueness
     const seen = {};
     for (let i = 0; i < hdrs.length; i++) {
       const h = hdrs[i];
@@ -297,17 +301,23 @@ export default function BulkUploadPage() {
 
   // ---------- recompute (sheet + start/header overrides) ----------
   function recomputeFromAoA(baseAoA) {
-    if (!baseAoA?.length) { setHeaders([]); setRows([]); setMappedRows([]); return; }
+    if (!baseAoA?.length) { setHeaders([]); setRows([]); setMappedRows([]); setTrimmedAoA([]); return; }
     const sr = Number(startRow) || 1;
     const sc = colLettersToIndex(startCol || "A");
-    const trimmed = baseAoA.slice(Math.max(0, sr - 1)).map((row) => row.slice(Math.max(0, sc - 1)));
+    const trimmed = baseAoA
+      .slice(Math.max(0, sr - 1))
+      .map((row) => row.slice(Math.max(0, sc - 1)));
+
+    setTrimmedAoA(trimmed);
 
     const { hdrs, body, headerRowIndex } = detectHeaderAndBodyFromAOA(
       trimmed,
       manualHeaderRow ? Number(manualHeaderRow) : undefined
     );
     setHeaders(hdrs); setRows(body);
-    setLastEvent(`Applied start: row ${sr}, col ${sc} · header row (within trimmed) = ${headerRowIndex}`);
+    setLastEvent(
+      `Applied start → row ${sr}, col ${sc} · header row (within trimmed) = ${headerRowIndex} · trimmedRows=${trimmed.length}`
+    );
     autoMap(hdrs, body);
   }
 
@@ -341,7 +351,7 @@ export default function BulkUploadPage() {
           setSelectedSheet(first || "");
           const base = map[first] || [];
           setRawAoA(base);
-          // initial parse without overrides
+          setTrimmedAoA([]); // not applied yet
           const { hdrs, body, headerRowIndex } = detectHeaderAndBodyFromAOA(base);
           setHeaders(hdrs); setRows(body);
           setLastEvent(`Sheet "${first}" · header row #${headerRowIndex} · rows=${body.length}`);
@@ -366,6 +376,7 @@ export default function BulkUploadPage() {
         setSheetsAoA({ CSV: aoa });
         setSelectedSheet("CSV");
         setRawAoA(aoa);
+        setTrimmedAoA([]);
         const { hdrs, body, headerRowIndex } = detectHeaderAndBodyFromAOA(aoa);
         setHeaders(hdrs); setRows(body);
         setLastEvent(`CSV · header row #${headerRowIndex} · rows=${body.length}`);
@@ -378,11 +389,12 @@ export default function BulkUploadPage() {
     setParseErr("Unsupported file type. Use .xls, .xlsx, or .csv.");
   }
 
-  // when sheet changes, recompute with current overrides
+  // When sheet changes, recompute with current overrides
   useEffect(() => {
     if (!selectedSheet) return;
     const base = sheetsAoA[selectedSheet] || [];
     setRawAoA(base);
+    setTrimmedAoA([]);
     if (base.length) recomputeFromAoA(base);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedSheet]);
@@ -393,6 +405,7 @@ export default function BulkUploadPage() {
   }
   function clearStart() {
     setStartRow(""); setStartCol(""); setManualHeaderRow("");
+    setTrimmedAoA([]);
     if (!rawAoA.length) return;
     const { hdrs, body, headerRowIndex } = detectHeaderAndBodyFromAOA(rawAoA);
     setHeaders(hdrs); setRows(body);
@@ -446,9 +459,9 @@ export default function BulkUploadPage() {
         </div>
 
         <p style={{ color: "#555" }}>
-          Parsers: XLSX <strong>{xlsxReady ? "ready" : "loading…"}</strong> ·
-          {" "}CSV <strong>{papaReady ? "ready" : "loading…"}</strong> ·
-          {" "}XLS (codepage) <strong>{cpexReady ? "ready" : "loading…"}</strong>
+          Parsers: XLSX <strong>{xlsxReady ? "ready" : "loading…"}</strong> ·{" "}
+          CSV <strong>{papaReady ? "ready" : "loading…"}</strong> ·{" "}
+          XLS (codepage) <strong>{cpexReady ? "ready" : "loading…"}</strong>
         </p>
 
         {/* File picker */}
@@ -519,6 +532,31 @@ export default function BulkUploadPage() {
                 </tbody>
               </table>
             </div>
+
+            {/* Trimmed grid (first 20 rows after Start row/col) */}
+            {trimmedAoA.length > 0 && (
+              <>
+                <div style={{ marginTop: 16, color: "#555" }}>
+                  Trimmed grid preview (first 20 rows after Start row/col):
+                </div>
+                <div style={{ maxHeight: 260, overflow: "auto", border: "1px solid #eee", borderRadius: 6, marginTop: 6 }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                    <tbody>
+                      {trimmedAoA.slice(0, 20).map((r, ri) => (
+                        <tr key={ri}>
+                          <td style={{ borderRight: "1px solid #eee", padding: 4, color: "#888" }}>{ri + 1}</td>
+                          {r.map((c, ci) => (
+                            <td key={ci} style={{ borderBottom: "1px solid #f6f6f6", padding: 4 }}>
+                              {String(c ?? "")}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
           </section>
         )}
 
